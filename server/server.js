@@ -12,6 +12,26 @@ const MAX_PLAYERS = Number(process.env.MAX_PLAYERS) || 8;
 const ORIGINS = (process.env.ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const MAX_EDITS = 200000;
+const PVP = (process.env.PVP || '1') !== '0';
+const DAY_SECONDS = 600;                 // must match the game
+let clockBase = DAY_SECONDS * 0.2, clockAt = Date.now(); // shared game clock, starts at the single-player default
+const gameSeconds = () => clockBase + (Date.now() - clockAt) / 1000;
+function timeMsg() {
+  const g = gameSeconds();
+  return { dayNumber: Math.floor(g / DAY_SECONDS) + 1, dayTime: (g % DAY_SECONDS) / DAY_SECONDS };
+}
+const items = new Map();                 // dropped items on the ground, shared by everyone
+const ITEM_TTL = 180000;                 // same three minutes as in the game
+const validId = v => typeof v === 'string' && /^[\w.\-]{1,40}$/.test(v);
+function cleanObj(o) {
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
+  try { const s = JSON.stringify(o); return s.length <= 300 ? JSON.parse(s) : null; } catch (e) { return null; }
+}
+function itemList() {
+  const now = Date.now();
+  return [...items.values()].filter(i => now - i.ts < ITEM_TTL).map(({ ts, ...rest }) => rest);
+}
+function broadcastAll(obj) { for (const c of clients.values()) if (c.joined) send(c, obj); }
 const MAX_FRAME = 64 * 1024;
 
 // ---------- world edits (block changes made by players) ----------
@@ -114,10 +134,12 @@ function handleMessage(c, text) {
     c.id = nextId++;
     c.pose = { x: 0, feet: 0, z: 0, yaw: 0, pitch: 0, held: '', sit: false };
     const others = [...clients.values()].filter(o => o.joined).map(o => ({ id: o.id, name: o.name, ...o.pose }));
+    const tm = timeMsg();
     send(c, {
       t: 'welcome', id: c.id, seed: SEED, max: MAX_PLAYERS,
       edits: [...edits].map(([k, v]) => { const [x, y, z] = k.split(',').map(Number); return [x, y, z, v[0], v[1]]; }),
       players: others,
+      dayNumber: tm.dayNumber, dayTime: tm.dayTime, items: itemList(), pvp: PVP,
     });
     clients.set(c.id, c);
     broadcast(c, { t: 'join', id: c.id, name: c.name, ...c.pose });
@@ -138,6 +160,41 @@ function handleMessage(c, text) {
     if (b.type === null) edits.set(k, [null, 0]); else edits.set(k, [b.type, b.meta]);
     scheduleSave();
     broadcast(c, { t: 'block', x: b.x, y: b.y, z: b.z, type: b.type, meta: b.meta, by: c.id });
+    return;
+  }
+  if (m.t === 'drop') {
+    if (!validId(m.id) || !TYPE_RE.test(m.type) || !validInt(m.count, 1, 64) || items.size >= 3000) return;
+    const it = { id: m.id, type: m.type, count: m.count,
+      x: num(m.x, 3e7), y: num(m.y, 200), z: num(m.z, 3e7),
+      vx: num(m.vx, 30), vy: num(m.vy, 30), vz: num(m.vz, 30), obj: cleanObj(m.obj), ts: Date.now() };
+    items.set(it.id, it);
+    const { ts, ...rest } = it;
+    broadcast(c, { t: 'drop', ...rest });
+    return;
+  }
+  if (m.t === 'pickup') {
+    const it = validId(m.id) ? items.get(m.id) : null;
+    if (!it || Date.now() - it.ts >= ITEM_TTL) { send(c, { t: 'pickup_no', id: m.id }); return; }
+    items.delete(it.id);
+    send(c, { t: 'pickup_ok', id: it.id, type: it.type, count: it.count, obj: it.obj });
+    broadcast(c, { t: 'gone', id: it.id });
+    return;
+  }
+  if (m.t === 'hit') {
+    if (!PVP || !validInt(m.target, 1, 1e9)) return;
+    const tgt = clients.get(m.target);
+    if (!tgt || tgt === c || !tgt.joined) return;
+    if (Math.hypot(tgt.pose.x - c.pose.x, tgt.pose.z - c.pose.z) > 5) return; // too far away
+    send(tgt, { t: 'hurt', by: c.name, dmg: validInt(m.dmg, 1, 10) ? m.dmg : 1 });
+    return;
+  }
+  if (m.t === 'slept') {
+    // Sleeping through the night moves the shared clock to the next morning.
+    const g = gameSeconds(), frac = (g % DAY_SECONDS) / DAY_SECONDS;
+    if (frac < 0.45) return;
+    clockBase = (Math.floor(g / DAY_SECONDS) + 1) * DAY_SECONDS + 0.04 * DAY_SECONDS;
+    clockAt = Date.now();
+    broadcastAll({ t: 'time', ...timeMsg() });
     return;
   }
   if (m.t === 'chat') {
@@ -180,5 +237,11 @@ setInterval(() => {
     try { c.socket.write(encodeFrame(0x9, Buffer.alloc(0))); } catch (e) {}
   }
 }, 25000).unref();
+
+setInterval(() => broadcastAll({ t: 'time', ...timeMsg() }), 5000).unref();
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, it] of items) if (now - it.ts >= ITEM_TTL) items.delete(id);
+}, 10000).unref();
 
 server.listen(PORT, () => console.log(`relay listening on :${PORT}, seed ${SEED}`));
