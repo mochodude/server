@@ -1,13 +1,9 @@
 {
   "name": "minecraft-classic-relay",
   "version": "1.0.0",
-  "description": "Multiplayer relay for Minecraft Classic",
+  "description": "Multiplayer relay for Minecraft Classic (no dependencies)",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
   "license": "MIT"
 }
